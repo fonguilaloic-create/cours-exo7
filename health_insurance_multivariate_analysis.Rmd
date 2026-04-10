@@ -1,0 +1,754 @@
+---
+title: "Multivariate Data Analysis of a Health Insurance Portfolio"
+subtitle: "STAT 7840 - Final Project: Three-Group Analysis of Lapse Behavior"
+author: "Franck Fonguila"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+    fig_caption: true
+    df_print: kable
+geometry: margin=1in
+fontsize: 11pt
+params:
+  data_path: "~/Downloads/Dataset of health insurance portfolio/Dataset of health insurance portfolio.xlsx"
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{float}
+  - \usepackage{amsmath,amssymb,bm}
+  - \usepackage{caption}
+  - \captionsetup[figure]{font=small,labelfont=bf}
+  - \captionsetup[table]{font=small,labelfont=bf}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.pos = "H",
+  out.width = "\\linewidth"
+)
+```
+
+```{r packages, include=FALSE}
+needed <- c(
+  "readxl", "dplyr", "tidyr", "ggplot2", "GGally", "knitr", "kableExtra",
+  "MASS", "heplots", "MVN", "candisc", "broom", "purrr", "stringr",
+  "gridExtra", "scatterplot3d", "reshape2", "patchwork"
+)
+new_pkg <- needed[!needed %in% rownames(installed.packages())]
+if (length(new_pkg) > 0) install.packages(new_pkg, repos = "https://cloud.r-project.org")
+invisible(lapply(needed, library, character.only = TRUE))
+
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      legend.position = "right"
+    )
+)
+```
+
+
+```{r data-import, include=FALSE}
+# Set the dataset path via RMarkdown params for easier knitting/reproducibility.
+data_path <- path.expand(params$data_path)
+
+if (!file.exists(data_path)) {
+  stop(
+    paste0(
+      "Dataset file not found at: ", data_path, "\n",
+      "Please knit with a valid parameter, e.g.\n",
+      "rmarkdown::render('health_insurance_multivariate_analysis.Rmd', ",
+      "params = list(data_path = '/absolute/path/to/Dataset of health insurance portfolio.xlsx'))"
+    )
+  )
+}
+
+raw_dat <- read_excel(data_path)
+
+# Basic cleaning and labels
+ins_dat <- raw_dat %>%
+  mutate(
+    lapse = factor(
+      lapse,
+      levels = c(1, 2, 3),
+      labels = c("Early_cancel", "Natural_end", "Active")
+    ),
+    gender = factor(gender),
+    type_policy = factor(type_policy),
+    type_policy_dg = factor(type_policy_dg),
+    type_product = factor(type_product),
+    reimbursement = factor(reimbursement),
+    new_business = factor(new_business),
+    distribution_channel = factor(distribution_channel),
+    log_premium = log(premium),
+    log_cost = log1p(cost_claims_year),
+    log_services = log1p(n_medical_services)
+  )
+
+# Raw variables used for PCA and broad portfolio description
+raw_vars <- c(
+  "age", "premium", "cost_claims_year",
+  "n_medical_services", "seniority_insured", "seniority_policy"
+)
+
+raw_dat6 <- ins_dat %>%
+  select(all_of(raw_vars)) %>%
+  drop_na()
+
+# Final transformed variables for multigroup inference and LDA
+# Policy seniority is omitted because it is nearly redundant with insured seniority.
+lda_vars <- c("age", "log_premium", "log_cost", "log_services", "seniority_insured")
+
+lda_dat <- ins_dat %>%
+  select(lapse, all_of(lda_vars)) %>%
+  drop_na()
+
+pretty_names <- c(
+  age = "Age (years)",
+  premium = "Premium (EUR)",
+  cost_claims_year = "Claims Cost (EUR)",
+  n_medical_services = "Medical Services",
+  seniority_insured = "Seniority - Insured (yr)",
+  seniority_policy = "Seniority - Policy (yr)",
+  log_premium = "log(Premium)",
+  log_cost = "log(1 + Claims Cost)",
+  log_services = "log(1 + Medical Services)"
+)
+
+scale01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  (x - rng[1]) / diff(rng)
+}
+```
+
+
+# 1. Introduction
+
+## 1.1 Background and motivation
+
+Health insurance policyholders do not all follow the same path. Some cancel their contracts early, some remain insured until the natural end of the policy, and others are still active at the time of observation. These three policy states may reflect meaningful differences in financial profile, healthcare utilization, and policy maturity. The central goal of this project is therefore to study whether policyholder characteristics jointly distinguish the three lapse groups --- **Early_cancel**, **Natural_end**, and **Active** --- and whether those characteristics can be used to explain and predict lapse behavior across the portfolio.
+
+A multivariate framework is needed because lapse behavior is not driven by a single variable. Age, premium, claims, medical utilization, and seniority are correlated and operate jointly. A sequence of complementary multivariate methods is used: PCA first describes the major dimensions of variation in the portfolio; groupwise diagnostics evaluate whether transformed variables are suitable for discriminant analysis; MANOVA tests whether the three policy states differ in their mean vectors; and classical LDA summarizes the separation through canonical discriminant functions.
+
+## 1.2 Research question
+
+**Primary question.** How do policyholder characteristics jointly distinguish **Early_cancel**, **Natural_end**, and **Active** policyholders, and how well can these variables explain and predict lapse behavior across the insurance portfolio?
+
+## 1.3 Analytical roadmap
+
+The analysis is organized as a story:
+
+1. describe the portfolio and the three policy states;
+2. identify the main background dimensions of variation with PCA;
+3. assess normality and covariance assumptions within each group;
+4. test whether the three groups differ jointly using MANOVA;
+5. fit a three-group LDA model and interpret the two canonical discriminant functions.
+
+A key theoretical point is that with $g = 3$ groups, **classical LDA can produce at most $g-1 = 2$ discriminant functions**. Therefore, the multigroup discriminant structure is fully summarized by **LD1** and **LD2**. There is no third canonical LDA score in the classical model.
+
+# 2. Data description
+
+```{r data-description}
+n_total <- nrow(ins_dat)
+n_policy <- if ("ID_policy" %in% names(ins_dat)) dplyr::n_distinct(ins_dat$ID_policy) else NA_integer_
+years_cov <- paste(sort(unique(ins_dat$period)), collapse = ", ")
+
+dim_tab <- tibble::tibble(
+  Characteristic = c(
+    "Total observations (policy-years)",
+    "Unique insurance policies",
+    "Calendar years covered",
+    "Total variables",
+    "Continuous analytic variables for PCA",
+    "Transformed variables used for MANOVA and LDA"
+  ),
+  Value = c(
+    format(n_total, big.mark = ","),
+    format(n_policy, big.mark = ","),
+    years_cov,
+    ncol(ins_dat),
+    length(raw_vars),
+    length(lda_vars)
+  )
+)
+
+kbl(dim_tab, caption = "Dataset dimensions and analytic structure.") %>%
+  kable_styling(full_width = FALSE)
+
+lapse_tab <- ins_dat %>%
+  count(lapse) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+
+kbl(lapse_tab,
+  col.names = c("Group", "n", "%"),
+  caption = "Policyholder counts by lapse status."
+) %>%
+  kable_styling(full_width = FALSE)
+```
+
+The six raw continuous variables used for portfolio-level exploration are age, premium, claims cost, number of medical services, insured seniority, and policy seniority. For the inferential and discriminant parts, the final working set is **age, log(premium), log(1 + claims cost), log(1 + medical services), and insured seniority**. Policy seniority is excluded at that stage because it is typically nearly redundant with insured seniority, a feature already visible in the earlier report and slides. The original report also showed that the portfolio is dominated by three lapse groups with Natural_end as the largest group and that the analysis initially focused only on Early_cancel and Active. Here that logic is extended to all three groups.
+
+# 3. Descriptive analysis of the three-group problem
+
+## 3.1 Overall univariate summaries
+
+```{r overall-univariate}
+overall_summ <- raw_dat6 %>%
+  summarise(across(everything(), list(
+    Mean = ~mean(.x, na.rm = TRUE),
+    SD = ~sd(.x, na.rm = TRUE),
+    Min = ~min(.x, na.rm = TRUE),
+    Median = ~median(.x, na.rm = TRUE),
+    Max = ~max(.x, na.rm = TRUE)
+  )))
+
+overall_summ_long <- overall_summ %>%
+  pivot_longer(everything(), names_to = c("Variable", ".value"), names_sep = "_") %>%
+  mutate(Variable = pretty_names[Variable])
+
+kbl(overall_summ_long, digits = 2,
+    caption = "Overall univariate summary statistics for the six raw analytic variables.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r overall-histograms, fig.height=6.2, fig.width=7.2}
+plot_dat <- ins_dat %>%
+  select(all_of(raw_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(pretty_names[variable], levels = pretty_names[raw_vars]))
+
+cuts <- ins_dat %>%
+  summarise(
+    premium_cut = quantile(premium, 0.99, na.rm = TRUE),
+    claims_cut = quantile(cost_claims_year, 0.99, na.rm = TRUE),
+    med_cut = quantile(n_medical_services, 0.99, na.rm = TRUE),
+    senI_cut = quantile(seniority_insured, 0.99, na.rm = TRUE),
+    senP_cut = quantile(seniority_policy, 0.99, na.rm = TRUE)
+  )
+
+plot_dat <- plot_dat %>%
+  filter(
+    !(variable == "Premium (EUR)" & value > cuts$premium_cut),
+    !(variable == "Claims Cost (EUR)" & value > cuts$claims_cut),
+    !(variable == "Medical Services" & value > cuts$med_cut),
+    !(variable == "Seniority - Insured (yr)" & value > cuts$senI_cut),
+    !(variable == "Seniority - Policy (yr)" & value > cuts$senP_cut)
+  )
+
+ggplot(plot_dat, aes(x = value)) +
+  geom_histogram(bins = 35, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 2) +
+  labs(
+    x = NULL, y = "Count",
+    title = "Univariate distributions of the six raw analytic variables",
+    subtitle = "For heavily skewed variables, the x-axis is truncated at the 99th percentile to highlight the main distributional shape."
+  )
+```
+
+The descriptive picture remains consistent with the earlier version of the report: premium, claims cost, and medical services are strongly right-skewed, while age is more regular but still heterogeneous. This already suggests that transformed variables will be more appropriate for multigroup inference than raw financial and utilization measures.
+
+## 3.2 Groupwise summaries by lapse status
+
+```{r group-summary}
+group_summ <- ins_dat %>%
+  group_by(lapse) %>%
+  summarise(
+    across(
+      all_of(c(raw_vars, lda_vars[lda_vars != "age"])),
+      list(mean = ~mean(.x, na.rm = TRUE), median = ~median(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+kbl(group_summ, digits = 2,
+    caption = "Groupwise descriptive summaries for raw and transformed variables.") %>%
+  kable_styling(full_width = FALSE, font_size = 9) %>%
+  scroll_box(width = "100%")
+```
+
+```{r group-density-raw, fig.height=6.2, fig.width=7.2}
+group_plot_dat <- ins_dat %>%
+  select(lapse, age, premium, cost_claims_year, n_medical_services, seniority_insured) %>%
+  pivot_longer(-lapse, names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(pretty_names[variable], levels = pretty_names[c("age", "premium", "cost_claims_year", "n_medical_services", "seniority_insured")]))
+
+ggplot(group_plot_dat, aes(x = value, color = lapse, fill = lapse)) +
+  geom_density(alpha = 0.15, adjust = 1.1) +
+  facet_wrap(~ variable, scales = "free", ncol = 2) +
+  labs(
+    x = NULL, y = "Density",
+    title = "Raw variable distributions by lapse group",
+    subtitle = "Substantial skewness and differing centers motivate transformed variables for the multigroup inferential analysis."
+  )
+```
+
+At this stage the project becomes more clearly aligned with the problem statement. The question is no longer whether **Early_cancel** differs from **Active** only, but whether the full set of policy states occupies different regions of the portfolio. In practice, the descriptive summaries usually show that **Early_cancel** has the lowest utilization profile, **Natural_end** tends to reflect the dominant middle-to-mature class, and **Active** often differs from both in a way that justifies multigroup discrimination.
+
+# 4. Correlation structure and PCA
+
+## 4.1 Correlation structure
+
+```{r corr-structure, fig.height=5.4, fig.width=6.8}
+R_raw <- cor(raw_dat6)
+R_melt <- reshape2::melt(R_raw)
+
+kbl(round(R_raw, 3), caption = "Sample correlation matrix for the six raw analytic variables.") %>%
+  kable_styling(full_width = FALSE)
+
+ggplot(R_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3) +
+  scale_fill_gradient2(low = "#2C7FB8", mid = "white", high = "#D95F0E", midpoint = 0) +
+  labs(title = "Correlation heatmap for the six raw analytic variables", x = NULL, y = NULL, fill = "r") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+As in the earlier report, the strongest dependence is usually between insured seniority and policy seniority. This near-redundancy supports dropping policy seniority from the later discriminant stage and keeping insured seniority as the more interpretable maturity variable.
+
+## 4.2 Principal Component Analysis
+
+```{r pca-analysis}
+pca_res <- prcomp(raw_dat6, scale. = TRUE)
+eigs <- pca_res$sdev^2
+pct_var <- 100 * eigs / sum(eigs)
+cum_var <- cumsum(pct_var)
+
+pca_tab <- tibble::tibble(
+  PC = paste0("PC", 1:length(eigs)),
+  Eigenvalue = round(eigs, 3),
+  `Percent Variance` = round(pct_var, 1),
+  `Cumulative Percent` = round(cum_var, 1)
+)
+
+kbl(pca_tab, caption = "PCA eigenvalues and variance explained.") %>%
+  kable_styling(full_width = FALSE)
+
+load_tab <- round(pca_res$rotation[, 1:3], 3)
+rownames(load_tab) <- pretty_names[rownames(load_tab)]
+
+kbl(load_tab, caption = "PCA loadings for the first three principal components.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r pca-plots, fig.height=4.8, fig.width=7.2}
+oldpar <- par(no.readonly = TRUE)
+layout(matrix(c(1, 2), nrow = 1))
+par(mar = c(4, 4, 2, 1))
+barplot(eigs, names.arg = paste0("PC", 1:length(eigs)), col = "steelblue",
+        main = "Scree Plot", ylab = "Eigenvalue")
+abline(h = 1, lty = 2, col = "red", lwd = 2)
+legend("topright", legend = "Kaiser criterion", lty = 2, col = "red", bty = "n")
+
+par(mar = c(4, 4, 2, 1))
+biplot(pca_res, scale = 0, cex = c(0.4, 0.8), main = "PCA Biplot")
+layout(1)
+par(oldpar)
+```
+
+The earlier project already showed a two-axis PCA structure in which one component reflects **insurance maturity** and the other reflects **healthcare utilization**. That interpretation still gives the right background story for the upgraded final project: PCA describes the broad geometry of the portfolio, and LDA later asks whether the three policy states occupy different regions inside that same multivariate space.
+
+# 5. Assumption checking for multigroup discrimination
+
+The inferential and discriminant stages are based on the transformed variables
+\[
+\text{Age},\quad \log(\text{Premium}),\quad \log(1+\text{Claims Cost}),\quad \log(1+\text{Medical Services}),\quad \text{Insured Seniority}.
+\]
+
+These transformations are used because raw premium, claims cost, and medical services are heavily right-skewed. The goal is not to force perfect normality, but to obtain distributions that are **reasonably better behaved** for MANOVA and LDA.
+
+## 5.1 Why the transformations were used
+
+- **log(Premium)** reduces right-skewness in annual premium and makes large values less dominant.
+- **log(1 + Claims Cost)** is appropriate because claims can be zero and are strongly right-skewed.
+- **log(1 + Medical Services)** is used for the same reason: service counts include many small values and a long upper tail.
+- **Age** and **Insured Seniority** are kept on their original scales because they are already interpretable and usually much less skewed.
+
+## 5.2 Groupwise density plots and Q-Q plots
+
+```{r transformed-density, fig.height=6.2, fig.width=7.2}
+trans_plot_dat <- lda_dat %>%
+  pivot_longer(-lapse, names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(pretty_names[variable], levels = pretty_names[lda_vars]))
+
+ggplot(trans_plot_dat, aes(x = value, color = lapse, fill = lapse)) +
+  geom_density(alpha = 0.15, adjust = 1.1) +
+  facet_wrap(~ variable, scales = "free", ncol = 2) +
+  labs(
+    x = NULL, y = "Density",
+    title = "Distributions of the final transformed variables by lapse group"
+  )
+```
+
+```{r qq-by-group, fig.height=7.8, fig.width=7.2}
+qq_data <- lda_dat %>%
+  pivot_longer(-lapse, names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(pretty_names[variable], levels = pretty_names[lda_vars]))
+
+ggplot(qq_data, aes(sample = value)) +
+  stat_qq(size = 0.4, alpha = 0.4) +
+  stat_qq_line(color = "firebrick", linewidth = 0.5) +
+  facet_grid(lapse ~ variable, scales = "free") +
+  labs(title = "Normal Q-Q plots by lapse group for the final transformed variables")
+```
+
+In most insurance datasets, the log and log1p transformations do not make the data perfectly normal, but they substantially reduce the extreme right-tail distortion that was obvious in the raw variables. That makes the transformed set more appropriate for practical multigroup discrimination.
+
+## 5.3 Representative scatterplots by group
+
+```{r pairwise-by-group, fig.height=7.2, fig.width=7.2}
+set.seed(123)
+pair_dat <- lda_dat %>%
+  group_by(lapse) %>%
+  slice_sample(n = min(1500, n())) %>%
+  ungroup()
+
+GGally::ggpairs(
+  pair_dat,
+  columns = 2:6,
+  mapping = aes(color = lapse, alpha = 0.25),
+  upper = list(continuous = wrap("cor", size = 3)),
+  lower = list(continuous = wrap("points", size = 0.4)),
+  diag = list(continuous = wrap("densityDiag", alpha = 0.4))
+)
+```
+
+These plots are useful for checking whether the three groups differ only in center or also in shape. They also show whether there is strong overlap, curvature, or outlying structure that might weaken the linear discrimination assumption.
+
+## 5.4 Mahalanobis diagnostics by group
+
+```{r maha-by-group, fig.height=6.2, fig.width=7.2}
+mah_plots <- list()
+mah_summary <- list()
+for (g in levels(lda_dat$lapse)) {
+  gdat <- lda_dat %>% filter(lapse == g) %>% select(-lapse)
+  mu_g <- colMeans(gdat)
+  S_g <- cov(gdat)
+  d2_g <- mahalanobis(gdat, center = mu_g, cov = S_g)
+  theo <- qchisq(ppoints(length(d2_g)), df = ncol(gdat))
+  obs <- sort(d2_g)
+  mah_df <- data.frame(theoretical = theo, observed = obs, group = g)
+  mah_plots[[g]] <- ggplot(mah_df, aes(theoretical, observed)) +
+    geom_point(alpha = 0.35, size = 0.7, color = "steelblue") +
+    geom_abline(intercept = 0, slope = 1, color = "firebrick") +
+    labs(title = paste("Mahalanobis Q-Q:", g), x = expression(chi^2~quantiles), y = "Observed distances")
+  cutoff <- qchisq(0.975, df = ncol(gdat))
+  mah_summary[[g]] <- tibble::tibble(
+    Group = g,
+    `Percent above 97.5% cutoff` = round(100 * mean(d2_g > cutoff), 2)
+  )
+}
+
+gridExtra::grid.arrange(grobs = mah_plots, ncol = 2)
+mah_summary_tab <- bind_rows(mah_summary)
+kbl(mah_summary_tab, caption = "Mahalanobis distance tail behavior by lapse group.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+Under exact multivariate normality, the Q-Q plots would follow the reference line closely and about 2.5% of observations would exceed the 97.5% chi-square cutoff. In practice, insurance data usually show heavier upper tails. The relevant question for this project is whether the transformed variables have made those departures moderate enough for MANOVA and LDA to be used as practical approximations.
+
+## 5.5 Covariance structure and Box's M test
+
+```{r covariance-check}
+boxm_res <- heplots::boxM(lda_dat[, lda_vars], lda_dat$lapse)
+boxm_tab <- tibble::tibble(
+  Statistic = c("Chi-square approximation", "df", "p-value"),
+  Value = c(round(boxm_res$statistic, 3), boxm_res$parameter, format.pval(boxm_res$p.value, digits = 4))
+)
+
+kbl(boxm_tab, caption = "Box's M test for equality of covariance matrices across the three lapse groups.") %>%
+  kable_styling(full_width = FALSE)
+
+cov_summ <- lda_dat %>%
+  group_by(lapse) %>%
+  group_split() %>%
+  purrr::map_df(function(df_g) {
+    S <- cov(df_g[, lda_vars])
+    tibble::tibble(
+      Group = unique(df_g$lapse),
+      `Trace(S)` = sum(diag(S)),
+      `Determinant(S)` = det(S)
+    )
+  })
+
+kbl(cov_summ, digits = 4,
+    caption = "Simple covariance summaries by lapse group.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+A significant Box's M test would indicate that the covariance matrices are not identical across groups. That does not automatically invalidate LDA, especially with large sample sizes, but it should be acknowledged as a limitation. The practical interpretation in this project is therefore based on both the formal test and the visual degree of overlap in the discriminant space.
+
+# 6. Global multigroup inference: MANOVA
+
+Because Hotelling's two-sample $T^2$ is designed for **two** groups, it is no longer the appropriate global mean-comparison tool here. For the three-group problem, a multivariate analysis of variance is the natural replacement.
+
+We test
+\[
+H_0: \bm{\mu}_{\text{Early\_cancel}} = \bm{\mu}_{\text{Natural\_end}} = \bm{\mu}_{\text{Active}}
+\]
+against the alternative that at least one group mean vector differs.
+
+```{r manova}
+man_fit <- manova(as.matrix(lda_dat[, lda_vars]) ~ lapse, data = lda_dat)
+man_pillai <- summary(man_fit, test = "Pillai")
+man_wilks  <- summary(man_fit, test = "Wilks")
+
+pillai_df <- broom::tidy(man_pillai$stats) %>%
+  mutate(Test = "Pillai")
+wilks_df  <- broom::tidy(man_wilks$stats) %>%
+  mutate(Test = "Wilks")
+man_tab <- bind_rows(pillai_df, wilks_df)
+
+kbl(man_tab, digits = 4,
+    caption = "MANOVA results for equality of group mean vectors across the three lapse states.") %>%
+  kable_styling(full_width = FALSE)
+
+uni_anova <- summary.aov(man_fit)
+```
+
+```{r univariate-followup}
+uni_tabs <- purrr::imap_dfr(uni_anova, function(obj, nm) {
+  tibble::tibble(
+    Variable = pretty_names[nm],
+    Df = obj[[1]]["lapse", "Df"],
+    `F value` = obj[[1]]["lapse", "F value"],
+    `Pr(>F)` = obj[[1]]["lapse", "Pr(>F)"]
+  )
+})
+
+kbl(uni_tabs, digits = 4,
+    caption = "Univariate follow-up ANOVA results for the transformed discriminant variables.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+If the MANOVA is significant, the correct conclusion is that the three policy states differ jointly in the transformed variable space. The follow-up univariate results do not replace the multivariate conclusion, but they help identify which variables contribute most strongly to the global separation.
+
+# 7. Three-group Linear Discriminant Analysis
+
+## 7.1 Model specification
+
+```{r lda-fit}
+prior_vec <- prop.table(table(lda_dat$lapse))
+lda_fit <- MASS::lda(lapse ~ ., data = lda_dat[, c("lapse", lda_vars)], prior = prior_vec)
+lda_fit
+
+# Canonical scores
+lda_pred_train <- predict(lda_fit)
+score_df <- cbind(lda_dat["lapse"], as.data.frame(lda_pred_train$x))
+colnames(score_df)[2:ncol(score_df)] <- paste0("LD", 1:(ncol(score_df)-1))
+
+# Explained discriminant variation
+sv <- lda_fit$svd^2
+prop_lda <- sv / sum(sv)
+prop_tab <- tibble::tibble(
+  Function = paste0("LD", 1:length(prop_lda)),
+  `Proportion of between-group variation` = round(prop_lda, 4),
+  `Percent` = round(100 * prop_lda, 2)
+)
+
+kbl(prop_tab, caption = "Relative importance of the canonical discriminant functions.") %>%
+  kable_styling(full_width = FALSE)
+
+coef_tab <- as.data.frame(lda_fit$scaling)
+coef_tab$Variable <- pretty_names[rownames(coef_tab)]
+coef_tab <- coef_tab %>% select(Variable, everything())
+
+kbl(round(coef_tab, 4),
+    caption = "Coefficients of the canonical discriminant functions.") %>%
+  kable_styling(full_width = FALSE)
+
+centroids <- score_df %>%
+  group_by(lapse) %>%
+  summarise(across(starts_with("LD"), mean), .groups = "drop")
+
+kbl(round(centroids, 4), caption = "Group centroids in canonical discriminant space.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+Because there are three groups, the LDA model produces exactly **two** canonical discriminant functions. These two functions are the complete discriminant summary of the classical model. If LD1 explains the large majority of the between-group variation and LD2 explains a smaller but still useful remainder, then LD1 provides the main axis of separation and LD2 supplies the secondary refinement.
+
+## 7.2 Classification performance
+
+```{r lda-performance}
+train_class <- lda_pred_train$class
+conf_train <- table(Actual = lda_dat$lapse, Predicted = train_class)
+train_acc <- mean(train_class == lda_dat$lapse)
+train_err <- 1 - train_acc
+
+cv_pred <- predict(lda_fit, newdata = lda_dat[, lda_vars], CV = TRUE)
+conf_cv <- table(Actual = lda_dat$lapse, Predicted = cv_pred$class)
+cv_acc <- mean(cv_pred$class == lda_dat$lapse)
+cv_err <- 1 - cv_acc
+
+perf_tab <- tibble::tibble(
+  Method = c("Apparent / training", "Leave-one-out CV"),
+  Accuracy = c(train_acc, cv_acc),
+  Error_Rate = c(train_err, cv_err)
+)
+
+kbl(round(perf_tab, 4), caption = "Overall classification performance of the three-group LDA.") %>%
+  kable_styling(full_width = FALSE)
+
+kbl(conf_train, caption = "Training confusion matrix for three-group LDA.") %>%
+  kable_styling(full_width = FALSE)
+
+kbl(conf_cv, caption = "Cross-validated confusion matrix for three-group LDA.") %>%
+  kable_styling(full_width = FALSE)
+
+class_perf <- tibble::tibble(
+  Group = rownames(conf_cv),
+  Sensitivity = diag(prop.table(conf_cv, 1)),
+  Precision = diag(prop.table(conf_cv, 2))
+)
+
+kbl(round(class_perf, 4), caption = "Class-specific performance from cross-validated LDA.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+The most informative quantity is not only the overall accuracy, but also **which groups are confused with one another**. In substantive terms, the question is whether **Natural_end** is closer to **Active** or to **Early_cancel**, and whether the dominant classification mistakes reflect real overlap rather than model failure.
+
+## 7.3 Visualizing the discriminant structure
+
+```{r ld12-plot, fig.height=5.6, fig.width=7}
+set.seed(123)
+plot_scores <- score_df %>%
+  group_by(lapse) %>%
+  slice_sample(n = min(4000, n())) %>%
+  ungroup()
+
+ggplot(plot_scores, aes(x = LD1, y = LD2, color = lapse)) +
+  geom_point(alpha = 0.25, size = 0.7) +
+  stat_ellipse(aes(fill = lapse), geom = "polygon", alpha = 0.10, color = NA, level = 0.68) +
+  geom_point(data = centroids, aes(x = LD1, y = LD2, color = lapse), size = 4) +
+  geom_text(data = centroids, aes(x = LD1, y = LD2, label = lapse), nudge_y = 0.15, show.legend = FALSE) +
+  labs(
+    title = "Canonical discriminant space: LD1 vs LD2",
+    subtitle = "With three groups, classical LDA yields at most two canonical discriminant functions.",
+    x = "LD1", y = "LD2"
+  )
+```
+
+```{r ld-densities, fig.height=6.2, fig.width=7.2}
+p1 <- ggplot(score_df, aes(x = LD1, fill = lapse, color = lapse)) +
+  geom_density(alpha = 0.20) +
+  labs(title = "Distribution of LD1 by group", x = "LD1", y = "Density")
+
+p2 <- ggplot(score_df, aes(x = LD2, fill = lapse, color = lapse)) +
+  geom_density(alpha = 0.20) +
+  labs(title = "Distribution of LD2 by group", x = "LD2", y = "Density")
+
+p3 <- ggplot(score_df, aes(x = lapse, y = LD1, fill = lapse)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "LD1 by group", x = NULL, y = "LD1")
+
+p4 <- ggplot(score_df, aes(x = lapse, y = LD2, fill = lapse)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "LD2 by group", x = NULL, y = "LD2")
+
+(p1 + p2) / (p3 + p4)
+```
+
+```{r optional-3d, fig.height=5.4, fig.width=6.8}
+# Optional 3D display for transformed variables or PCA-style visualization,
+# not a nonexistent third LDA score.
+set.seed(321)
+three_d <- lda_dat %>%
+  group_by(lapse) %>%
+  slice_sample(n = min(1000, n())) %>%
+  ungroup()
+cols3 <- c("Early_cancel" = "#D95F02", "Natural_end" = "#1B9E77", "Active" = "#7570B3")
+scatterplot3d::scatterplot3d(
+  x = three_d$log_cost,
+  y = three_d$log_services,
+  z = three_d$log_premium,
+  color = cols3[three_d$lapse],
+  pch = 16,
+  main = "Optional 3D view of transformed utilization and financial variables",
+  xlab = "log(1 + Claims Cost)",
+  ylab = "log(1 + Medical Services)",
+  zlab = "log(Premium)"
+)
+legend("topright", legend = names(cols3), col = cols3, pch = 16, bty = "n")
+```
+
+The 3D figure above is intentionally based on **transformed original variables**, not on a nonexistent third canonical LDA score. This keeps the presentation mathematically correct: in classical LDA with three groups, the canonical discriminant space is fully described by **LD1** and **LD2**.
+
+# 8. Interpretation and discussion
+
+## 8.1 What LD1 and LD2 represent
+
+The meaning of the discriminant functions should be inferred from the coefficient table, the group centroids, and the visual separation patterns.
+
+- If **LD1** loads strongly on log-cost and log-services, then it primarily represents a **healthcare utilization / claims intensity** axis.
+- If **LD1** instead combines age, premium, and seniority, it behaves more like a **maturity / financial commitment** axis.
+- If **LD2** captures the contrast not already explained by LD1, it often serves as a **secondary maturity-versus-utilization correction** that helps distinguish the dominant middle group from the other two.
+
+In a well-structured final presentation, the interpretation should connect these axes back to the earlier PCA story. If PCA found a maturity component and a utilization component, and the LDA functions show a similar contrast, then the multigroup discrimination is consistent with the underlying structure of the portfolio rather than an artifact of one isolated method.
+
+## 8.2 Narrative interpretation of the three groups
+
+The final story should directly answer the research question.
+
+- Are **Early_cancel**, **Natural_end**, and **Active** clearly separated, or do they overlap heavily?
+- Does **Natural_end** behave more like **Active** or more like **Early_cancel**?
+- Which variables contribute most to practical separation?
+- Does LD1 carry most of the discrimination, with LD2 only fine-tuning the picture, or are both needed materially?
+
+If the LD1--LD2 plot shows that most separation is already visible along LD1 and that LD2 mainly improves the placement of one group, then the interpretation is that the two-function classical LDA solution is sufficient. That is exactly what theory predicts: with three groups, two canonical scores are the maximum and also the full discriminant summary.
+
+## 8.3 Limitations
+
+Several limitations should be stated clearly.
+
+1. **Non-normality.** Even after transformation, insurance variables often retain heavy tails.
+2. **Outliers.** Extreme claims are part of the real structure of the portfolio and may affect covariance-based methods.
+3. **Class imbalance.** Natural_end is far larger than the other groups, so apparent accuracy alone can be misleading.
+4. **Covariance heterogeneity.** If Box's M is significant, the equal-covariance assumption is only approximate.
+
+These limitations do not invalidate the analysis, but they affect how strongly the classification results should be interpreted.
+
+# 9. Conclusion
+
+This upgraded analysis addresses the full three-group lapse problem rather than the earlier two-group comparison. PCA describes the broad geometry of the portfolio, assumption checks justify the use of transformed variables, MANOVA tests whether the three policy states differ jointly, and classical LDA summarizes that separation through the only two canonical functions available when $g=3$.
+
+The final conclusion should be written after running the code, but the structure is clear:
+
+- the three lapse states are analyzed jointly;
+- the discriminant space is two-dimensional, not three-dimensional;
+- the main practical question is how strongly the policy states overlap and which variables drive the separation.
+
+# References
+
+- Johnson, R. A., & Wichern, D. W. (2007). *Applied Multivariate Statistical Analysis* (6th ed.). Pearson.
+- Course material from STAT 7840, Auburn University.
+- Bermúdez, L., Karlis, D., & Santolino, M. (2021). Dataset: Spanish health insurance portfolio. Mendeley Data.
+
+# Appendix: Key code excerpts
+
+## Final variable set used for MANOVA and LDA
+
+```{r appendix-vars, echo=TRUE}
+lda_vars
+```
+
+## Three-group LDA fit
+
+```{r appendix-lda, echo=TRUE}
+prior_vec <- prop.table(table(lda_dat$lapse))
+lda_fit <- MASS::lda(lapse ~ ., data = lda_dat[, c("lapse", lda_vars)], prior = prior_vec)
+```
+
+## Cross-validated predictions
+
+```{r appendix-cv, echo=TRUE}
+cv_pred <- predict(lda_fit, newdata = lda_dat[, lda_vars], CV = TRUE)
+```
